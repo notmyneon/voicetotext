@@ -1,0 +1,14 @@
+VOICE NOTES DEPLOYMENT CHECKLIST
+
+[ ] 1. Create an OpenAI API key for this project.
+[ ] 2. Create a Cloudflare Worker.
+[ ] 3. Paste cloudflare-worker/worker.js into the Worker.
+[ ] 4. Add OPENAI_API_KEY as a Cloudflare SECRET.
+[ ] 5. Add ALLOWED_ORIGINS as your GitHub Pages origin.
+[ ] 6. Deploy Worker and copy its workers.dev URL.
+[ ] 7. Create GitHub repo and upload this folder.
+[ ] 8. Enable GitHub Pages from main /docs.
+[ ] 9. Open the GitHub Pages site.
+[ ] 10. Open Transcription settings and paste the Worker URL.
+[ ] 11. Test backend connection.
+[ ] 12. Save settings and test dictation.
