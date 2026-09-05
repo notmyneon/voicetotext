@@ -22,7 +22,7 @@
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); }
-    button, input, textarea { font: inherit; }
+    button, input, textarea, select { font: inherit; }
     button { -webkit-tap-highlight-color: transparent; }
     .app { min-height: 100vh; display: grid; grid-template-columns: 290px 1fr; }
     .sidebar { background: #fbf9fc; border-right: 1px solid var(--border); padding: 22px 16px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
@@ -82,7 +82,12 @@
     .field { display: grid; gap: 7px; }
     .field label { font-size: 13px; font-weight: 750; }
     .field small { color: var(--muted); line-height: 1.4; }
-    .field input, .field textarea { width: 100%; min-height: auto; border: 1px solid var(--border); border-radius: 10px; padding: 10px 11px; background: #fff; outline: 0; font-size: 14px; }
+    .field input, .field textarea, .field select { width: 100%; min-height: auto; border: 1px solid var(--border); border-radius: 10px; padding: 10px 11px; background: #fff; outline: 0; font-size: 14px; }
+    .check-row { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--border); border-radius: 10px; padding: 11px; background: #fff; }
+    .check-row input { width: 18px; height: 18px; margin-top: 1px; flex: 0 0 auto; }
+    .check-row strong { display: block; font-size: 13px; margin-bottom: 3px; }
+    .check-row span { color: var(--muted); font-size: 12px; line-height: 1.4; }
+    .mode-badge { display: inline-flex; align-items: center; margin-left: 7px; padding: 3px 7px; border-radius: 999px; background: var(--soft); color: var(--accent-dark); font-size: 11px; font-weight: 750; vertical-align: 2px; }
     .field textarea { height: 88px; resize: vertical; }
     .modal-actions { padding: 14px 22px 20px; display: flex; justify-content: flex-end; gap: 8px; }
     .primary { background: var(--accent); color: white; border-color: var(--accent); }
@@ -129,8 +134,8 @@
         <div class="card">
           <div class="dictation-panel">
             <div class="dictation-copy">
-              <h2>High-accuracy dictation</h2>
-              <p>Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed and added to your note.</p>
+              <h2><span id="dictationTitle">High-accuracy dictation</span><span class="mode-badge" id="modeBadge">1 speaker</span></h2>
+              <p id="dictationDescription">Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed, punctuated, and added to your note.</p>
             </div>
             <button class="mic-btn" id="micBtn" aria-label="Start dictation" title="Start dictation">🎤</button>
           </div>
@@ -158,10 +163,27 @@
         <small>Paste the Cloudflare Worker URL here once it is deployed.</small>
       </div>
       <div class="field">
+        <label for="transcriptionMode">Transcription mode</label>
+        <select id="transcriptionMode">
+          <option value="dictation">Dictation — best accuracy for one speaker</option>
+          <option value="conversation">Conversation — separate different speakers</option>
+        </select>
+        <small>Conversation mode labels each voice as Speaker 1, Speaker 2, and so on.</small>
+      </div>
+      <div class="field">
+        <label for="topicContext">What are you talking about?</label>
+        <textarea id="topicContext" placeholder="Example: Grade 4 classroom planning meeting about Alberta math curriculum and student assessment."></textarea>
+        <small>Optional. A short description gives the transcription model useful context and can improve accuracy.</small>
+      </div>
+      <div class="field">
         <label for="vocabulary">Helpful words and names</label>
         <textarea id="vocabulary" placeholder="Example: Alberta, Lethbridge, morphology, phonics, Nicole, ..."></textarea>
-        <small>Optional. Add names, curriculum terms, places, acronyms, or other words that are often misheard. Separate them with commas or new lines.</small>
+        <small>Optional. These are sent as literal keyword hints in dictation mode and are also used by the punctuation cleanup pass.</small>
       </div>
+      <label class="check-row" for="polishTranscript">
+        <input id="polishTranscript" type="checkbox" checked />
+        <div><strong>Smart punctuation and cleanup</strong><span>Correct punctuation, capitalization, spacing, and obvious recognition spelling errors without rewriting what was said.</span></div>
+      </label>
       <button class="btn" id="testConnectionBtn" type="button">Test backend connection</button>
       <div class="connection-result" id="connectionResult"></div>
     </div>
@@ -194,6 +216,12 @@
     const settingsDialog = document.getElementById('settingsDialog');
     const backendUrl = document.getElementById('backendUrl');
     const vocabulary = document.getElementById('vocabulary');
+    const transcriptionMode = document.getElementById('transcriptionMode');
+    const topicContext = document.getElementById('topicContext');
+    const polishTranscript = document.getElementById('polishTranscript');
+    const dictationTitle = document.getElementById('dictationTitle');
+    const dictationDescription = document.getElementById('dictationDescription');
+    const modeBadge = document.getElementById('modeBadge');
     const testConnectionBtn = document.getElementById('testConnectionBtn');
     const connectionResult = document.getElementById('connectionResult');
     const cancelSettingsBtn = document.getElementById('cancelSettingsBtn');
@@ -225,8 +253,16 @@
     function loadSettings() {
       try {
         const value = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-        return { backendUrl: value.backendUrl || '', vocabulary: value.vocabulary || '' };
-      } catch { return { backendUrl: '', vocabulary: '' }; }
+        return {
+          backendUrl: value.backendUrl || '',
+          vocabulary: value.vocabulary || '',
+          mode: value.mode === 'conversation' ? 'conversation' : 'dictation',
+          topic: value.topic || '',
+          polish: value.polish !== false
+        };
+      } catch {
+        return { backendUrl: '', vocabulary: '', mode: 'dictation', topic: '', polish: true };
+      }
     }
 
     function persistNotes() { localStorage.setItem(NOTES_KEY, JSON.stringify(notes)); }
@@ -291,9 +327,21 @@
       return String(text || '').split(/[\n,]+/).map(s=>s.trim()).filter(Boolean).slice(0,80);
     }
 
+    function updateModeCopy() {
+      const conversation = settings.mode === 'conversation';
+      dictationTitle.textContent = conversation ? 'Conversation transcription' : 'High-accuracy dictation';
+      modeBadge.textContent = conversation ? 'speaker labels' : '1 speaker';
+      dictationDescription.textContent = conversation
+        ? 'Record a conversation, then stop. Different voices are separated into Speaker 1, Speaker 2, and so on, with punctuation cleanup applied.'
+        : 'Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed, punctuated, and added to your note.';
+    }
+
     function openSettings() {
       backendUrl.value = settings.backendUrl || '';
       vocabulary.value = settings.vocabulary || '';
+      transcriptionMode.value = settings.mode || 'dictation';
+      topicContext.value = settings.topic || '';
+      polishTranscript.checked = settings.polish !== false;
       connectionResult.textContent = '';
       connectionResult.className = 'connection-result';
       settingsDialog.showModal();
@@ -302,8 +350,16 @@
     settingsBtn.addEventListener('click', openSettings);
     cancelSettingsBtn.addEventListener('click', () => settingsDialog.close());
     saveSettingsBtn.addEventListener('click', () => {
-      settings = { backendUrl: normalizeBackendUrl(backendUrl.value), vocabulary: vocabulary.value.trim() };
-      persistSettings(); settingsDialog.close();
+      settings = {
+        backendUrl: normalizeBackendUrl(backendUrl.value),
+        vocabulary: vocabulary.value.trim(),
+        mode: transcriptionMode.value === 'conversation' ? 'conversation' : 'dictation',
+        topic: topicContext.value.trim(),
+        polish: polishTranscript.checked
+      };
+      persistSettings();
+      updateModeCopy();
+      settingsDialog.close();
       showNotice('Transcription settings saved.', 'ok');
     });
 
@@ -395,7 +451,8 @@
       if (!note) throw new Error('The note being dictated into could not be found.');
 
       const base = note.text || '';
-      const separator = base && !/[\s\n]$/.test(base) ? ' ' : '';
+      const isSpeakerTranscript = /^Speaker\s+\d+:/i.test(text);
+      const separator = !base ? '' : isSpeakerTranscript ? '\n\n' : /[\s\n]$/.test(base) ? '' : ' ';
       note.text = base + separator + text;
       note.updatedAt = Date.now();
       persistNotes();
@@ -416,6 +473,9 @@
       const fd = new FormData();
       fd.append('audio', blob, `dictation.${extensionForMime(mimeType)}`);
       fd.append('context', JSON.stringify(parseVocabulary(settings.vocabulary)));
+      fd.append('mode', settings.mode === 'conversation' ? 'conversation' : 'dictation');
+      fd.append('topic', settings.topic || '');
+      fd.append('polish', settings.polish === false ? 'false' : 'true');
 
       let response;
       try {
@@ -441,23 +501,37 @@
         throw new Error('The backend completed the request but returned no transcription text.');
       }
 
-      return transcript;
+      return {
+        text: transcript,
+        warning: String(data?.warning || '').trim(),
+        speakerCount: Number(data?.speakerCount || 1),
+        polished: Boolean(data?.polished)
+      };
     }
 
     async function processFinishedRecording(blob, mimeType, noteId) {
       isTranscribing = true;
       micBtn.disabled = true;
       setStatus('Transcribing…', 'processing');
-      queueText.textContent = 'Sending your recording for high-accuracy transcription…';
+      queueText.textContent = settings.mode === 'conversation'
+        ? 'Separating speakers and transcribing the conversation…'
+        : 'Sending your recording for high-accuracy transcription and punctuation cleanup…';
 
       try {
         if (!blob || blob.size < 500) {
           throw new Error('The recording contained too little audio. Try speaking for a few seconds before stopping.');
         }
 
-        const transcript = await transcribeBlob(blob, mimeType);
-        appendTranscriptToNote(noteId, transcript);
-        showNotice('Dictation added to your note.', 'ok');
+        const result = await transcribeBlob(blob, mimeType);
+        appendTranscriptToNote(noteId, result.text);
+        if (result.warning) {
+          showNotice(`Transcription added. The punctuation cleanup could not run, so the original transcript was kept: ${result.warning}`, 'error');
+        } else if (settings.mode === 'conversation') {
+          const count = result.speakerCount || 1;
+          showNotice(`Conversation added with ${count} detected speaker${count === 1 ? '' : 's'}.`, 'ok');
+        } else {
+          showNotice(result.polished ? 'Dictation added with smart punctuation.' : 'Dictation added to your note.', 'ok');
+        }
         setStatus('Ready');
       } catch (err) {
         const message = err?.message || String(err);
@@ -592,6 +666,7 @@
     window.addEventListener('beforeunload', () => { saveActiveImmediate(); stopTracks(); });
 
     if (!notes.length) createNote(); else render();
+    updateModeCopy();
     if (!settings.backendUrl) showNotice('Voice Notes is ready, but the high-accuracy transcription backend still needs to be connected. Open Transcription settings after deploying the Worker.');
   </script>
 </body>
