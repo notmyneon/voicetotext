@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#6f4b7f" />
-  <title>Voice Notes</title>
+  <title>Voice Notes — Conversation Mode</title>
   <style>
     :root {
       --bg: #f6f3f8;
@@ -88,6 +88,11 @@
     .check-row strong { display: block; font-size: 13px; margin-bottom: 3px; }
     .check-row span { color: var(--muted); font-size: 12px; line-height: 1.4; }
     .mode-badge { display: inline-flex; align-items: center; margin-left: 7px; padding: 3px 7px; border-radius: 999px; background: var(--soft); color: var(--accent-dark); font-size: 11px; font-weight: 750; vertical-align: 2px; }
+    .mode-switch { display: inline-flex; gap: 4px; margin-top: 12px; padding: 4px; border: 1px solid var(--border); border-radius: 12px; background: #f8f5f9; }
+    .mode-choice { border: 0; border-radius: 9px; padding: 8px 12px; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; font-weight: 750; }
+    .mode-choice:hover { background: #fff; color: var(--ink); }
+    .mode-choice.active { background: var(--accent); color: #fff; box-shadow: 0 3px 10px rgba(111,75,127,.18); }
+    .mode-choice:disabled { opacity: .55; cursor: not-allowed; }
     .field textarea { height: 88px; resize: vertical; }
     .modal-actions { padding: 14px 22px 20px; display: flex; justify-content: flex-end; gap: 8px; }
     .primary { background: var(--accent); color: white; border-color: var(--accent); }
@@ -136,6 +141,10 @@
             <div class="dictation-copy">
               <h2><span id="dictationTitle">High-accuracy dictation</span><span class="mode-badge" id="modeBadge">1 speaker</span></h2>
               <p id="dictationDescription">Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed, punctuated, and added to your note.</p>
+              <div class="mode-switch" aria-label="Transcription mode">
+                <button class="mode-choice active" id="dictationModeBtn" type="button">Dictation</button>
+                <button class="mode-choice" id="conversationModeBtn" type="button">Conversation</button>
+              </div>
             </div>
             <button class="mic-btn" id="micBtn" aria-label="Start dictation" title="Start dictation">🎤</button>
           </div>
@@ -222,6 +231,8 @@
     const dictationTitle = document.getElementById('dictationTitle');
     const dictationDescription = document.getElementById('dictationDescription');
     const modeBadge = document.getElementById('modeBadge');
+    const dictationModeBtn = document.getElementById('dictationModeBtn');
+    const conversationModeBtn = document.getElementById('conversationModeBtn');
     const testConnectionBtn = document.getElementById('testConnectionBtn');
     const connectionResult = document.getElementById('connectionResult');
     const cancelSettingsBtn = document.getElementById('cancelSettingsBtn');
@@ -332,8 +343,24 @@
       dictationTitle.textContent = conversation ? 'Conversation transcription' : 'High-accuracy dictation';
       modeBadge.textContent = conversation ? 'speaker labels' : '1 speaker';
       dictationDescription.textContent = conversation
-        ? 'Record a conversation, then stop. Different voices are separated into Speaker 1, Speaker 2, and so on, with punctuation cleanup applied.'
+        ? 'Record a conversation, then stop. Different voices are separated into Speaker 1, Speaker 2, and so on.'
         : 'Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed, punctuated, and added to your note.';
+      dictationModeBtn.classList.toggle('active', !conversation);
+      conversationModeBtn.classList.toggle('active', conversation);
+      dictationModeBtn.setAttribute('aria-pressed', String(!conversation));
+      conversationModeBtn.setAttribute('aria-pressed', String(conversation));
+      transcriptionMode.value = conversation ? 'conversation' : 'dictation';
+    }
+
+    function switchMode(mode) {
+      if (isRecording || isTranscribing) {
+        showNotice('Finish the current recording before switching modes.', 'error');
+        return;
+      }
+      settings.mode = mode === 'conversation' ? 'conversation' : 'dictation';
+      persistSettings();
+      updateModeCopy();
+      hideNotice();
     }
 
     function openSettings() {
@@ -348,7 +375,15 @@
     }
 
     settingsBtn.addEventListener('click', openSettings);
-    cancelSettingsBtn.addEventListener('click', () => settingsDialog.close());
+    dictationModeBtn.addEventListener('click', () => switchMode('dictation'));
+    conversationModeBtn.addEventListener('click', () => switchMode('conversation'));
+    transcriptionMode.addEventListener('change', () => {
+      settings.mode = transcriptionMode.value === 'conversation' ? 'conversation' : 'dictation';
+    });
+    cancelSettingsBtn.addEventListener('click', () => {
+      transcriptionMode.value = settings.mode;
+      settingsDialog.close();
+    });
     saveSettingsBtn.addEventListener('click', () => {
       settings = {
         backendUrl: normalizeBackendUrl(backendUrl.value),
