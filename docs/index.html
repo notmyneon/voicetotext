@@ -130,7 +130,7 @@
           <div class="dictation-panel">
             <div class="dictation-copy">
               <h2>High-accuracy dictation</h2>
-              <p>Press the microphone and speak naturally. Accurate transcription is added to the note after each natural pause, using one microphone stream only.</p>
+              <p>Press the microphone and speak naturally. Press the square when you are finished; the complete recording is then transcribed and added to your note.</p>
             </div>
             <button class="mic-btn" id="micBtn" aria-label="Start dictation" title="Start dictation">🎤</button>
           </div>
@@ -174,10 +174,7 @@
   <script>
     const NOTES_KEY = 'voiceNotes.v2';
     const SETTINGS_KEY = 'voiceNotes.transcriptionSettings.v1';
-    const SEGMENT_MAX_MS = 18000;
-    const SILENCE_SPLIT_MS = 1200;
-    const MIN_SEGMENT_MS = 2200;
-    const SILENCE_RMS = 0.018;
+    const MAX_RECORDING_MS = 10 * 60 * 1000;
 
     const noteList = document.getElementById('noteList');
     const newNoteBtn = document.getElementById('newNoteBtn');
@@ -209,21 +206,12 @@
 
     let stream = null;
     let recorder = null;
-    let segmentChunks = [];
+    let recordedChunks = [];
     let isRecording = false;
-    let stopping = false;
-    let segmentStartedAt = 0;
-    let heardSpeechInSegment = false;
-    let lastSoundAt = 0;
-    let audioContext = null;
-    let analyser = null;
-    let analyserData = null;
-    let vadFrame = null;
-    let segmentSequence = 0;
-    let nextSequenceToCommit = 0;
-    let transcriptResults = new Map();
-    let pendingCount = 0;
+    let isTranscribing = false;
     let sessionNoteId = null;
+    let recordingStartedAt = 0;
+    let maxRecordingTimer = null;
 
     function uid() {
       return (crypto.randomUUID && crypto.randomUUID()) || String(Date.now()) + Math.random().toString(16).slice(2);
@@ -262,7 +250,7 @@
         item.className = 'note-item' + (note.id === activeId ? ' active' : '');
         item.innerHTML = `<div class="note-item-title">${escapeHtml(note.title.trim() || firstLine(note.text) || 'Untitled note')}</div><div class="note-item-date">${formatDate(note.updatedAt)}</div>`;
         item.addEventListener('click', () => {
-          if (isRecording || stopping) { showNotice('Stop dictation before switching notes.', 'error'); return; }
+          if (isRecording || isTranscribing) { showNotice('Stop dictation before switching notes.', 'error'); return; }
           saveActiveImmediate(); activeId = note.id; render();
         });
         noteList.appendChild(item);
@@ -337,12 +325,12 @@
     noteText.addEventListener('input', () => { updateWordCount(); scheduleSave(); });
 
     newNoteBtn.addEventListener('click', () => {
-      if (isRecording || stopping) { showNotice('Stop dictation before creating a new note.', 'error'); return; }
+      if (isRecording || isTranscribing) { showNotice('Stop dictation before creating a new note.', 'error'); return; }
       saveActiveImmediate(); createNote();
     });
 
     deleteBtn.addEventListener('click', () => {
-      if (isRecording || stopping) { showNotice('Stop dictation before deleting a note.', 'error'); return; }
+      if (isRecording || isTranscribing) { showNotice('Stop dictation before deleting a note.', 'error'); return; }
       if (!activeId) return;
       const idx = notes.findIndex(n=>n.id===activeId); notes = notes.filter(n=>n.id!==activeId);
       if (!notes.length) { activeId = null; persistNotes(); createNote(); return; }
@@ -363,149 +351,245 @@
     });
 
     function supportedMimeType() {
-      const choices = ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4'];
+      const choices = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4'
+      ];
       return choices.find(type => window.MediaRecorder && MediaRecorder.isTypeSupported(type)) || '';
     }
 
     function extensionForMime(mime) {
-      if (mime.includes('ogg')) return 'ogg';
-      if (mime.includes('mp4')) return 'm4a';
+      const value = String(mime || '').toLowerCase();
+      if (value.includes('ogg')) return 'ogg';
+      if (value.includes('mp4')) return 'm4a';
       return 'webm';
     }
 
-    async function setupVAD(mediaStream) {
-      audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const source = audioContext.createMediaStreamSource(mediaStream);
-      analyser = audioContext.createAnalyser(); analyser.fftSize = 1024; analyser.smoothingTimeConstant = .25;
-      analyserData = new Float32Array(analyser.fftSize); source.connect(analyser);
-      lastSoundAt = performance.now();
-      const tick = () => {
-        if (!isRecording || !analyser) return;
-        analyser.getFloatTimeDomainData(analyserData);
-        let sum = 0; for (let i=0;i<analyserData.length;i++) sum += analyserData[i]*analyserData[i];
-        const rms = Math.sqrt(sum/analyserData.length); const now = performance.now();
-        if (rms > SILENCE_RMS) { heardSpeechInSegment = true; lastSoundAt = now; }
-        const age = now - segmentStartedAt;
-        const silentFor = now - lastSoundAt;
-        if (!stopping && recorder?.state === 'recording' && ((heardSpeechInSegment && age >= MIN_SEGMENT_MS && silentFor >= SILENCE_SPLIT_MS) || age >= SEGMENT_MAX_MS)) {
-          rotateSegment();
-        }
-        vadFrame = requestAnimationFrame(tick);
-      };
-      vadFrame = requestAnimationFrame(tick);
-    }
-
-    function buildRecorder() {
-      const mimeType = supportedMimeType();
-      recorder = mimeType ? new MediaRecorder(stream,{mimeType}) : new MediaRecorder(stream);
-      segmentChunks = []; segmentStartedAt = performance.now(); heardSpeechInSegment = false; lastSoundAt = segmentStartedAt;
-      recorder.ondataavailable = e => { if (e.data && e.data.size) segmentChunks.push(e.data); };
-      recorder.onstop = () => {
-        const chunks = segmentChunks; const type = recorder.mimeType || supportedMimeType() || 'audio/webm';
-        const duration = performance.now() - segmentStartedAt;
-        if (chunks.length && duration > 400) queueTranscription(new Blob(chunks,{type}), type);
-        if (isRecording && !stopping) { buildRecorder(); recorder.start(500); }
-        else if (stopping) finishStoppingWhenReady();
-      };
-      return recorder;
-    }
-
-    function rotateSegment() {
-      if (!recorder || recorder.state !== 'recording' || stopping) return;
-      try { recorder.stop(); } catch {}
-    }
-
-    async function queueTranscription(blob, mimeType) {
-      const seq = segmentSequence++;
-      pendingCount++; updateQueueText();
-      try {
-        const text = await transcribeBlob(blob, mimeType);
-        transcriptResults.set(seq, {ok:true, text});
-      } catch (err) {
-        transcriptResults.set(seq, {ok:false, error: err.message || String(err)});
-      } finally {
-        pendingCount--; commitReadyTranscripts(); updateQueueText(); finishStoppingWhenReady();
+    function stopTracks() {
+      if (stream) {
+        stream.getTracks().forEach(track => {
+          try { track.stop(); } catch {}
+        });
       }
+      stream = null;
     }
 
-    function updateQueueText() {
-      if (pendingCount > 0) queueText.textContent = `${pendingCount} audio segment${pendingCount===1?' is':'s are'} being transcribed…`;
-      else if (isRecording && !stopping) queueText.textContent = 'Listening — accurate text will appear after a natural pause.';
-      else queueText.textContent = '';
+    function resetMicUi() {
+      isRecording = false;
+      micBtn.classList.remove('listening');
+      micBtn.textContent = '🎤';
+      micBtn.title = 'Start dictation';
+      micBtn.setAttribute('aria-label', 'Start dictation');
+      micBtn.disabled = false;
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      maxRecordingTimer = null;
+    }
+
+    function appendTranscriptToNote(noteId, transcript) {
+      const text = String(transcript || '').trim();
+      if (!text) throw new Error('The transcription service returned an empty transcript. No text was added.');
+
+      const note = getNoteById(noteId);
+      if (!note) throw new Error('The note being dictated into could not be found.');
+
+      const base = note.text || '';
+      const separator = base && !/[\s\n]$/.test(base) ? ' ' : '';
+      note.text = base + separator + text;
+      note.updatedAt = Date.now();
+      persistNotes();
+
+      if (note.id === activeId) {
+        noteText.value = note.text;
+        updatedText.textContent = 'Saved ' + formatDate(note.updatedAt);
+        updateWordCount();
+        noteText.scrollTop = noteText.scrollHeight;
+      }
+      renderList();
     }
 
     async function transcribeBlob(blob, mimeType) {
       const base = normalizeBackendUrl(settings.backendUrl);
       if (!base) throw new Error('No transcription backend is configured.');
+
       const fd = new FormData();
       fd.append('audio', blob, `dictation.${extensionForMime(mimeType)}`);
       fd.append('context', JSON.stringify(parseVocabulary(settings.vocabulary)));
-      const response = await fetch(base + '/transcribe', { method:'POST', body:fd });
-      const data = await response.json().catch(()=>({}));
-      if (!response.ok) throw new Error(data.error || `Transcription failed (HTTP ${response.status}).`);
-      return String(data.text || '').trim();
+
+      let response;
+      try {
+        response = await fetch(base + '/transcribe', {
+          method: 'POST',
+          body: fd
+        });
+      } catch (err) {
+        throw new Error(`Could not reach the transcription backend: ${err.message || err}`);
+      }
+
+      const raw = await response.text();
+      let data = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw }; }
+
+      if (!response.ok) {
+        const message = data?.error?.message || data?.error || data?.raw || `Transcription failed (HTTP ${response.status}).`;
+        throw new Error(String(message));
+      }
+
+      const transcript = String(data?.text || '').trim();
+      if (!transcript) {
+        throw new Error('The backend completed the request but returned no transcription text.');
+      }
+
+      return transcript;
     }
 
-    function commitReadyTranscripts() {
-      while (transcriptResults.has(nextSequenceToCommit)) {
-        const result = transcriptResults.get(nextSequenceToCommit); transcriptResults.delete(nextSequenceToCommit); nextSequenceToCommit++;
-        if (!result.ok) { showNotice(`One section could not be transcribed: ${result.error}`, 'error'); continue; }
-        if (!result.text) continue;
-        const note = getNoteById(sessionNoteId); if (!note) continue;
-        const base = note.text || '';
-        const needsSpace = base && !/[\s\n]$/.test(base);
-        note.text = base + (needsSpace ? ' ' : '') + result.text;
-        note.updatedAt = Date.now(); persistNotes();
-        if (note.id === activeId) { noteText.value = note.text; updatedText.textContent = 'Saved ' + formatDate(note.updatedAt); updateWordCount(); noteText.scrollTop = noteText.scrollHeight; }
-        renderList();
+    async function processFinishedRecording(blob, mimeType, noteId) {
+      isTranscribing = true;
+      micBtn.disabled = true;
+      setStatus('Transcribing…', 'processing');
+      queueText.textContent = 'Sending your recording for high-accuracy transcription…';
+
+      try {
+        if (!blob || blob.size < 500) {
+          throw new Error('The recording contained too little audio. Try speaking for a few seconds before stopping.');
+        }
+
+        const transcript = await transcribeBlob(blob, mimeType);
+        appendTranscriptToNote(noteId, transcript);
+        showNotice('Dictation added to your note.', 'ok');
+        setStatus('Ready');
+      } catch (err) {
+        const message = err?.message || String(err);
+        showNotice(`Dictation was not added: ${message}`, 'error');
+        setStatus('Transcription failed');
+      } finally {
+        isTranscribing = false;
+        recorder = null;
+        recordedChunks = [];
+        queueText.textContent = '';
+        resetMicUi();
+        saveActiveImmediate();
       }
     }
 
     async function startRecording() {
       hideNotice();
-      if (!settings.backendUrl) { showNotice('Set up the transcription backend first.', 'error'); openSettings(); return; }
-      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { showNotice('This browser does not support microphone recording. Use current Chrome or Edge.', 'error'); return; }
-      saveActiveImmediate(); sessionNoteId = activeId;
-      segmentSequence = 0; nextSequenceToCommit = 0; transcriptResults.clear(); pendingCount = 0; stopping = false;
+
+      if (isTranscribing) {
+        showNotice('Please wait for the current transcription to finish.', 'error');
+        return;
+      }
+
+      if (!settings.backendUrl) {
+        showNotice('Set up the transcription backend first.', 'error');
+        openSettings();
+        return;
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+        showNotice('This browser does not support microphone recording. Use current Chrome or Edge.', 'error');
+        return;
+      }
+
+      saveActiveImmediate();
+      sessionNoteId = activeId;
+      recordedChunks = [];
+
       try {
-        setStatus('Requesting microphone…','processing');
-        stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-        isRecording = true; micBtn.classList.add('listening'); micBtn.textContent='■'; micBtn.title='Stop dictation'; micBtn.setAttribute('aria-label','Stop dictation');
-        buildRecorder(); recorder.start(500); setupVAD(stream); setStatus('Listening…','live'); updateQueueText();
+        setStatus('Requesting microphone…', 'processing');
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          },
+          video: false
+        });
+
+        const mimeType = supportedMimeType();
+        recorder = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+
+        const actualType = recorder.mimeType || mimeType || 'audio/webm';
+
+        recorder.ondataavailable = event => {
+          if (event.data && event.data.size > 0) recordedChunks.push(event.data);
+        };
+
+        recorder.onerror = event => {
+          const detail = event?.error?.message || event?.error?.name || 'Unknown recording error.';
+          showNotice(`Microphone recording error: ${detail}`, 'error');
+        };
+
+        recorder.onstop = () => {
+          const chunks = recordedChunks.slice();
+          const blob = new Blob(chunks, { type: actualType });
+          stopTracks();
+          processFinishedRecording(blob, actualType, sessionNoteId);
+        };
+
+        recorder.start(1000);
+        recordingStartedAt = Date.now();
+        isRecording = true;
+        micBtn.classList.add('listening');
+        micBtn.textContent = '■';
+        micBtn.title = 'Stop dictation';
+        micBtn.setAttribute('aria-label', 'Stop dictation');
+        setStatus('Listening…', 'live');
+        queueText.textContent = 'Recording — press the square when you are finished speaking.';
+
+        maxRecordingTimer = setTimeout(() => {
+          if (isRecording) stopRecording();
+        }, MAX_RECORDING_MS);
       } catch (err) {
-        cleanupRecording();
-        const message = err?.name === 'NotAllowedError' ? 'Microphone permission was blocked. Allow microphone access for this site, then try again.' : `Could not start the microphone: ${err.message || err}`;
-        showNotice(message,'error'); setStatus('Ready');
+        stopTracks();
+        recorder = null;
+        recordedChunks = [];
+        resetMicUi();
+        setStatus('Ready');
+
+        const message = err?.name === 'NotAllowedError'
+          ? 'Microphone permission was blocked. Allow microphone access for this site, then try again.'
+          : `Could not start the microphone: ${err.message || err}`;
+
+        showNotice(message, 'error');
       }
     }
 
     function stopRecording() {
-      if (!isRecording || stopping) return;
-      stopping = true; setStatus('Finishing recording…','processing');
-      if (recorder?.state === 'recording') { try { recorder.stop(); } catch { finishStoppingWhenReady(); } }
-      else finishStoppingWhenReady();
+      if (!isRecording || !recorder) return;
+
+      isRecording = false;
+      micBtn.disabled = true;
+      setStatus('Finishing recording…', 'processing');
+      queueText.textContent = 'Preparing the recording for transcription…';
+
+      if (maxRecordingTimer) clearTimeout(maxRecordingTimer);
+      maxRecordingTimer = null;
+
+      try {
+        if (recorder.state === 'recording') {
+          try { recorder.requestData(); } catch {}
+          recorder.stop();
+        } else {
+          throw new Error(`Recorder stopped unexpectedly (${recorder.state}).`);
+        }
+      } catch (err) {
+        stopTracks();
+        recorder = null;
+        recordedChunks = [];
+        isTranscribing = false;
+        resetMicUi();
+        setStatus('Ready');
+        queueText.textContent = '';
+        showNotice(`Could not finish the recording: ${err.message || err}`, 'error');
+      }
     }
 
-    function finishStoppingWhenReady() {
-      if (!stopping) return;
-      if (recorder?.state === 'recording') return;
-      if (pendingCount > 0 || transcriptResults.size > 0) { setStatus('Transcribing final words…','processing'); return; }
-      cleanupRecording(); setStatus('Ready'); showNotice('Dictation added to your note.', 'ok');
-    }
-
-    function cleanupRecording() {
-      isRecording = false; stopping = false;
-      if (vadFrame) cancelAnimationFrame(vadFrame); vadFrame = null;
-      if (audioContext) { try { audioContext.close(); } catch {} audioContext = null; }
-      analyser = null; analyserData = null;
-      if (stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
-      recorder = null; segmentChunks = [];
-      micBtn.classList.remove('listening'); micBtn.textContent='🎤'; micBtn.title='Start dictation'; micBtn.setAttribute('aria-label','Start dictation');
-      updateQueueText(); saveActiveImmediate();
-    }
-
-    micBtn.addEventListener('click', () => { if (isRecording) stopRecording(); else startRecording(); });
-    window.addEventListener('beforeunload', () => { saveActiveImmediate(); if (stream) stream.getTracks().forEach(t=>t.stop()); });
+    micBtn.addEventListener('click', () => { if (isRecording) stopRecording(); else if (!isTranscribing) startRecording(); });
+    window.addEventListener('beforeunload', () => { saveActiveImmediate(); stopTracks(); });
 
     if (!notes.length) createNote(); else render();
     if (!settings.backendUrl) showNotice('Voice Notes is ready, but the high-accuracy transcription backend still needs to be connected. Open Transcription settings after deploying the Worker.');
